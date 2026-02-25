@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
-"""
-poll_inject.py
-
-Recursively poll a directory and, for files modified/created in the last X seconds,
-prepend a language-specific snippet as the very first lines.
-
-Defaults:
-  root: /sgoinfre/goinfre/Perso
-  window: 30 seconds
-  poll interval: 2 seconds
-"""
-
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
+import select
+import struct
 import sys
-import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Iterator, Optional, Set
 
-# -----------------------------
-# Easy-to-setup configuration
-# -----------------------------
+DEFAULT_USER = os.environ.get("USER", "achaisne")
+DEFAULT_ROOT = f"/sgoinfre/goinfre/Perso/{DEFAULT_USER}"
+DEFAULT_TEST_ACTION_DIR = "/home/achaisne/sgoinfre/test"
+DEFAULT_POLL_SECONDS = 2.0
+DEFAULT_EXCLUDED_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    ".cache",
+    ".venv",
+    "venv",
+    "target",
+    "build",
+    "dist",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+}
 
-DEFAULT_ROOT = "/sgoinfre/goinfre/Perso"
-DEFAULT_WINDOW_SECONDS = 30
-DEFAULT_POLL_SECONDS = 2
-
-# Marker used to avoid injecting multiple times
 MARKER = "FROM ACHAISNE CONTACT si@42paris.fr. WITH LOVE"
 
-# Per-extension injection text (prepended at file start).
-# Make changes here to customize the inserted code.
-INJECTIONS: Dict[str, str] = {
+INJECTIONS = {
     ".py": (
         f"# {MARKER}\n"
         "print('hello world')\n"
@@ -74,29 +74,38 @@ INJECTIONS: Dict[str, str] = {
     ),
 }
 
-# -----------------------------
-# Helpers
-# -----------------------------
+IN_CLOSE_WRITE = 0x00000008
+IN_ATTRIB = 0x00000004
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_DONT_FOLLOW = 0x02000000
+IN_EXCL_UNLINK = 0x04000000
+IN_ISDIR = 0x40000000
 
-def newest_timestamp(st: os.stat_result) -> float:
-    """
-    "created or modified" on Linux is tricky; st_ctime is inode change time,
-    not true creation time. We approximate by taking max(mtime, ctime).
-    """
-    return max(st.st_mtime, st.st_ctime)
+WATCH_MASK = (
+    IN_CLOSE_WRITE
+    | IN_MOVED_TO
+    | IN_CREATE
+    | IN_ATTRIB
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF
+)
+
+
+def split_excluded_dirs(value: str) -> Set[str]:
+    return {chunk.strip() for chunk in value.split(",") if chunk.strip()}
+
+
+def should_skip_dir_name(name: str, excluded_dirs: Set[str]) -> bool:
+    return name in excluded_dirs
 
 
 def already_injected(head: str) -> bool:
-    # Only check the first ~2KB for the marker.
     return MARKER in head
-
-
-def read_head(path: Path, nbytes: int = 2048) -> str:
-    try:
-        with path.open("rb") as f:
-            return f.read(nbytes).decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
 
 
 def safe_write_atomic(path: Path, content: bytes) -> None:
@@ -108,118 +117,226 @@ def safe_write_atomic(path: Path, content: bytes) -> None:
     tmp.replace(path)
 
 
-def inject_file(path: Path, injection: str, make_backup: bool, dry_run: bool) -> Tuple[bool, str]:
-    """
-    Returns (changed, message)
-    """
+def inject_file(path: Path, injection: str, dry_run: bool) -> tuple[bool, str]:
     try:
-        original_bytes = path.read_bytes()
+        original = path.read_bytes()
     except Exception as e:
         return False, f"READ FAIL: {path} ({e})"
 
-    head = original_bytes[:2048].decode("utf-8", errors="ignore")
+    head = original[:2048].decode("utf-8", errors="ignore")
     if already_injected(head):
         return False, f"SKIP (already injected): {path}"
-
-    new_bytes = injection.encode("utf-8") + original_bytes
 
     if dry_run:
         return True, f"DRY RUN would inject: {path}"
 
-    if make_backup:
-        backup = path.with_suffix(path.suffix + ".bak")
-        try:
-            # Don't overwrite an existing backup
-            if not backup.exists():
-                backup.write_bytes(original_bytes)
-        except Exception as e:
-            return False, f"BACKUP FAIL: {path} -> {backup} ({e})"
-
     try:
-        safe_write_atomic(path, new_bytes)
+        safe_write_atomic(path, injection.encode("utf-8") + original)
     except Exception as e:
         return False, f"WRITE FAIL: {path} ({e})"
 
     return True, f"INJECTED: {path}"
 
 
-def iter_target_files(root: Path, exts: Tuple[str, ...]):
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix in exts:
-            yield p
+def iter_dirs_for_watch(root: Path, excluded_dirs: Set[str]) -> Iterator[Path]:
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        yield current
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if should_skip_dir_name(entry.name, excluded_dirs):
+                        continue
+                    stack.append(Path(entry.path))
+        except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+            continue
 
 
-# -----------------------------
-# Main loop
-# -----------------------------
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+class InotifyTreeWatcher:
+    def __init__(self, root: Path, excluded_dirs: Set[str]):
+        self.root = root
+        self.excluded_dirs = excluded_dirs
+        self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        self.wd_to_dir: Dict[int, Path] = {}
+        self.dir_to_wd: Dict[Path, int] = {}
+        self._add_existing_dirs()
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+        self.wd_to_dir.clear()
+        self.dir_to_wd.clear()
+
+    def _add_watch(self, directory: Path) -> None:
+        if directory in self.dir_to_wd:
+            return
+        wd = self.libc.inotify_add_watch(
+            self.fd,
+            str(directory).encode("utf-8", errors="ignore"),
+            WATCH_MASK | IN_EXCL_UNLINK | IN_DONT_FOLLOW,
+        )
+        if wd < 0:
+            return
+        self.dir_to_wd[directory] = wd
+        self.wd_to_dir[wd] = directory
+
+    def _add_existing_dirs(self) -> None:
+        for directory in iter_dirs_for_watch(self.root, self.excluded_dirs):
+            self._add_watch(directory)
+
+    def _remove_watch(self, wd: int) -> None:
+        base = self.wd_to_dir.pop(wd, None)
+        if base is not None:
+            self.dir_to_wd.pop(base, None)
+
+    def _decode_name(self, raw_name: bytes) -> str:
+        name = raw_name.split(b"\x00", 1)[0]
+        return name.decode("utf-8", errors="ignore")
+
+    def read_changed_files(self, timeout_seconds: float) -> Set[Path]:
+        changed: Set[Path] = set()
+        readable, _, _ = select.select([self.fd], [], [], timeout_seconds)
+        if not readable:
+            return changed
+
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            if not data:
+                break
+
+            offset = 0
+            while offset + 16 <= len(data):
+                wd, mask, _cookie, name_len = struct.unpack_from("iIII", data, offset)
+                name_raw = data[offset + 16 : offset + 16 + name_len]
+                offset += 16 + name_len
+
+                if mask & IN_Q_OVERFLOW:
+                    continue
+                if mask & IN_IGNORED:
+                    self._remove_watch(wd)
+                    continue
+
+                base = self.wd_to_dir.get(wd)
+                if base is None:
+                    continue
+
+                name = self._decode_name(name_raw)
+                path = base / name if name else base
+
+                if mask & IN_ISDIR:
+                    if name and should_skip_dir_name(name, self.excluded_dirs):
+                        continue
+                    if mask & (IN_CREATE | IN_MOVED_TO):
+                        self._add_watch(path)
+                    continue
+
+                changed.add(path)
+
+        return changed
+
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Poll a folder and prepend hello/exit snippets to recent files.")
-    ap.add_argument("--root", default=DEFAULT_ROOT, help=f"Root folder to poll (default: {DEFAULT_ROOT})")
-    ap.add_argument("--window", type=int, default=DEFAULT_WINDOW_SECONDS, help="Seconds threshold for recent files (default: 30)")
-    ap.add_argument("--poll", type=float, default=DEFAULT_POLL_SECONDS, help="Polling interval in seconds (default: 2)")
-    ap.add_argument("--once", action="store_true", help="Run one scan only (no continuous polling)")
-    ap.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
-    ap.add_argument("--backup", action="store_true", help="Write a .bak backup next to modified files")
-    ap.add_argument("--verbose", action="store_true", help="Print skipped files too")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Inotify tree watcher with code injection.")
+    parser.add_argument("--root", default=DEFAULT_ROOT, help=f"Tree to watch (default: {DEFAULT_ROOT})")
+    parser.add_argument("--action-dir", default="", help="Optional folder where injection is allowed")
+    parser.add_argument(
+        "--stop-after-first",
+        action="store_true",
+        help="Exit after first successful injection",
+    )
+    parser.add_argument("--poll", type=float, default=DEFAULT_POLL_SECONDS, help="Event wait timeout (seconds)")
+    parser.add_argument("--dry-run", action="store_true", help="Log changes without writing files")
+    parser.add_argument("--verbose", action="store_true", help="Log skipped files")
+    parser.add_argument(
+        "--exclude-dir",
+        default="",
+        help="Comma-separated directory names to skip (in addition to built-ins)",
+    )
+    args = parser.parse_args()
 
-    root = Path(args.root)
-    if not root.exists() or not root.is_dir():
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
         print(f"ERROR: root is not a directory: {root}", file=sys.stderr)
         return 2
 
-    exts = tuple(INJECTIONS.keys())
+    action_dir: Optional[Path] = None
+    if args.action_dir:
+        action_dir = Path(args.action_dir).expanduser().resolve()
 
-    print(f"Polling root: {root}")
-    print(f"Extensions: {', '.join(exts)}")
-    print(f"Recent window: {args.window}s | Poll interval: {args.poll}s")
+    excluded_dirs = set(DEFAULT_EXCLUDED_DIRS)
+    excluded_dirs.update(split_excluded_dirs(args.exclude_dir))
+
+    print(f"Watching root: {root}")
+    print(f"Target extensions: {', '.join(INJECTIONS.keys())}")
+    print(f"Poll interval: {args.poll:.1f}s")
+    if action_dir:
+        print(f"Action folder filter: {action_dir}")
+    else:
+        print("Action folder filter: <none>")
     if args.dry_run:
-        print("Mode: DRY RUN (no writes)")
-    if args.backup:
-        print("Backups: ENABLED (.bak)")
+        print("Mode: DRY RUN")
 
-    # Track what we already processed recently to avoid noisy repeated attempts
-    seen: Dict[Path, float] = {}
+    print("Initializing inotify watches...")
+    try:
+        watcher = InotifyTreeWatcher(root, excluded_dirs)
+    except Exception as e:
+        print(f"ERROR: cannot initialize inotify mode: {e}", file=sys.stderr)
+        return 2
 
-    while True:
-        now = time.time()
-        changed_count = 0
+    print(f"READY: inotify watches active ({len(watcher.wd_to_dir)} directories).")
+    print("READY: you can touch files now.")
 
-        for path in iter_target_files(root, exts):
-            try:
-                st = path.stat()
-            except Exception:
+    injected_count = 0
+    try:
+        while True:
+            changed_paths = watcher.read_changed_files(args.poll)
+            if not changed_paths:
                 continue
 
-            ts = newest_timestamp(st)
-            age = now - ts
-            if age > args.window:
-                continue
+            for path in sorted(changed_paths):
+                if path.suffix not in INJECTIONS:
+                    continue
 
-            # Debounce: don't try the same file too often
-            last = seen.get(path, 0.0)
-            if now - last < max(1.0, args.poll):
-                continue
-            seen[path] = now
+                abs_path = path.resolve()
+                if action_dir and not path_is_within(abs_path, action_dir):
+                    if args.verbose:
+                        print(f"SKIP (outside action folder): {path}")
+                    continue
 
-            injection = INJECTIONS.get(path.suffix)
-            if not injection:
-                continue
+                if not abs_path.exists() or not abs_path.is_file():
+                    continue
 
-            changed, msg = inject_file(path, injection, make_backup=args.backup, dry_run=args.dry_run)
-            if changed:
-                changed_count += 1
-                print(msg)
-            else:
-                if args.verbose:
+                changed, msg = inject_file(abs_path, INJECTIONS[path.suffix], dry_run=args.dry_run)
+                if changed:
+                    injected_count += 1
                     print(msg)
+                    if args.stop_after_first:
+                        print(f"STOP: first injection done ({injected_count}).")
+                        return 0
+                elif args.verbose:
+                    print(msg)
+    finally:
+        watcher.close()
 
-        if args.once:
-            print(f"Done. Changed: {changed_count}")
-            return 0
-
-        time.sleep(args.poll)
 
 if __name__ == "__main__":
     raise SystemExit(main())

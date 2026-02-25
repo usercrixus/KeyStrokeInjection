@@ -1,25 +1,37 @@
-TEST_FILE ?= /sgoinfre/goinfre/Perso/achaisne/test/hello.c
-TEST_ROOT := $(dir $(TEST_FILE))
-TEST_WINDOW ?= 3600
+SHELL := /bin/sh
 
-basis:
-	python3 poolingServer.py
-once:
-	python3 poolingServer.py --once
-agressive:
-	python3 poolingServer.py --window 30 --poll 0.5
-dryrun:
-	python3 poolingServer.py --dry-run --once
-backup:
-	python3 poolingServer.py --backup --once
+SCRIPT := poolingServer.py
+PYTHON ?= python3
+USER_NAME ?= $(or $(USER),$(shell id -u))
 
-# Tester for a specific file outside default 30s window constraints.
-test-hello-dryrun:
-	@test -f "$(TEST_FILE)" || (echo "Missing test file: $(TEST_FILE)" && exit 1)
-	@touch "$(TEST_FILE)"
-	python3 poolingServer.py --root "$(TEST_ROOT)" --window $(TEST_WINDOW) --dry-run --once --verbose
+ROOT ?= /sgoinfre/goinfre/Perso/$(USER_NAME)
+TEST_ACTION_DIR ?= /home/achaisne/sgoinfre/test
+POLL ?= 2
+EXCLUDE_DIR ?=
 
-test-hello:
-	@test -f "$(TEST_FILE)" || (echo "Missing test file: $(TEST_FILE)" && exit 1)
-	@touch "$(TEST_FILE)"
-	python3 poolingServer.py --root "$(TEST_ROOT)" --window $(TEST_WINDOW) --backup --once --verbose
+.PHONY: help deploy test
+
+help:
+	@echo "Usage:"
+	@echo "  make deploy                  # watch full ROOT forever and inject on matching files"
+	@echo "  make test                    # watch full ROOT, inject only in TEST_ACTION_DIR, stop after first injection"
+	@echo ""
+	@echo "Params (override with make VAR=value ...):"
+	@echo "  ROOT=$(ROOT)"
+	@echo "  TEST_ACTION_DIR=$(TEST_ACTION_DIR)"
+	@echo "  POLL=$(POLL)"
+	@echo "  EXCLUDE_DIR=$(EXCLUDE_DIR)"
+
+deploy:
+	PYTHONUNBUFFERED=1 $(PYTHON) $(SCRIPT) \
+		--root "$(ROOT)" \
+		--poll $(POLL) \
+		--exclude-dir "$(EXCLUDE_DIR)"
+
+test:
+	PYTHONUNBUFFERED=1 $(PYTHON) $(SCRIPT) \
+		--root "$(ROOT)" \
+		--action-dir "$(TEST_ACTION_DIR)" \
+		--stop-after-first \
+		--poll $(POLL) \
+		--exclude-dir "$(EXCLUDE_DIR)"
