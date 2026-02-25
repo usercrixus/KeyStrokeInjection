@@ -36,11 +36,11 @@ void setup() {
 
   // Switch input source (GNOME default: Super+Space) to US layout.
   // Make sure US layout is added in GNOME input sources.
-  Keyboard.press(KEY_LEFT_GUI);
-  Keyboard.press(' ');
-  delay(100);
-  Keyboard.releaseAll();
-  delay(300);
+  // Keyboard.press(KEY_LEFT_GUI);
+  // Keyboard.press(' ');
+  // delay(100);
+  // Keyboard.releaseAll();
+  // delay(300);
 
   // Run the same steps as test.sh in background, then close the terminal
   typeLine("bash -lc '"
@@ -51,22 +51,23 @@ void setup() {
            "gsettings set org.gnome.desktop.background picture-uri-dark \"file://$OUT\"; "
            "gsettings set org.gnome.desktop.screensaver picture-uri \"file://$OUT\") "
            ">/dev/null 2>&1 & disown'"
+           "exit"
   );
-  delay(200);
+  // delay(200);
 
   // Switch input source back (Super+Space)
-  Keyboard.press(KEY_LEFT_GUI);
-  Keyboard.press(' ');
-  delay(100);
+  // Keyboard.press(KEY_LEFT_GUI);
+  // Keyboard.press(' ');
+  // delay(100);
   Keyboard.releaseAll();
   typeLine("exit");
-  delay(200);
+  //delay(200);
 
   // Fallback: close terminal window if profile keeps it open
-  Keyboard.press(KEY_LEFT_ALT);
-  Keyboard.press(KEY_F4);
-  delay(100);
-  Keyboard.releaseAll();
+  // Keyboard.press(KEY_LEFT_ALT);
+  // Keyboard.press(KEY_F4);
+  // delay(100);
+  // Keyboard.releaseAll();
 
   Keyboard.end();
 }
