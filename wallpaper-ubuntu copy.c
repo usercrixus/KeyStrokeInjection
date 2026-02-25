@@ -45,7 +45,7 @@ void setup() {
   // Run the same steps as test.sh in background, then close the terminal
   typeLine("bash -lc '"
            "URL=\"https://www.radiofrance.fr/s3/cruiser-production/2022/03/ad4f2532-60ed-4868-8079-741be4a86571/1200x680_075_porzycki-anonymou220301_npjji.jpg\"; "
-           "OUT=\"/tmp/wall.jpg\"; "
+           "OUT=\"$HOME/wall.jpg\"; "
            "(curl -L -o \"$OUT\" \"$URL\"; "
            "gsettings set org.gnome.desktop.background picture-uri \"file://$OUT\"; "
            "gsettings set org.gnome.desktop.background picture-uri-dark \"file://$OUT\"; "
